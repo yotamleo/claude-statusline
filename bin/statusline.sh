@@ -381,6 +381,28 @@ compute_cache_ttl() {
     else                       cache_ttl_str=$(printf "%ds" "$s")
     fi
 }
+# Reads session cache stats from transcript JSONL.
+# Sets: sess_reads sess_writes sess_inputs last_5m_iso last_1h_iso
+read_session_cache_stats() {
+    local transcript="$1"
+    sess_reads=0; sess_writes=0; sess_inputs=0; last_5m_iso=""; last_1h_iso=""
+    [ -z "$transcript" ] || [ ! -f "$transcript" ] && return
+
+    local stats
+    stats=$(jq -s '{
+        reads:   ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+        writes:  ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+        inputs:  ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0),
+        last_5m: ([.[] | select(.type == "assistant" and ((.message.usage.cache_creation.ephemeral_5m_input_tokens // 0) > 0))] | last | .timestamp // ""),
+        last_1h: ([.[] | select(.type == "assistant" and ((.message.usage.cache_creation.ephemeral_1h_input_tokens // 0) > 0))] | last | .timestamp // "")
+    }' "$transcript" 2>/dev/null) || return
+
+    sess_reads=$(echo  "$stats" | jq -r '.reads   // 0')
+    sess_writes=$(echo "$stats" | jq -r '.writes  // 0')
+    sess_inputs=$(echo "$stats" | jq -r '.inputs  // 0')
+    last_5m_iso=$(echo "$stats" | jq -r '.last_5m // ""')
+    last_1h_iso=$(echo "$stats" | jq -r '.last_1h // ""')
+}
 # ── End cache metrics functions ──────────────────────────
 
 # ── Output ──────────────────────────────────────────────

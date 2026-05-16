@@ -130,5 +130,32 @@ else
     echo "FAIL: fresh write want pct>=99, got ${cache_ttl_pct}%"; FAIL=$(( FAIL + 1 ))
 fi
 
+# ── read_session_cache_stats tests ────────────────────────
+TMPDIR_TEST=$(mktemp -d)
+TRANSCRIPT="$TMPDIR_TEST/session.jsonl"
+
+cat > "$TRANSCRIPT" <<'EOF'
+{"type":"user","message":{"role":"user","content":"hello"}}
+{"type":"assistant","timestamp":"2026-05-16T10:00:00.000Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"cache_creation_input_tokens":5000,"cache_read_input_tokens":0,"output_tokens":50,"cache_creation":{"ephemeral_1h_input_tokens":5000,"ephemeral_5m_input_tokens":0}}}}
+{"type":"assistant","timestamp":"2026-05-16T10:05:00.000Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":18000,"output_tokens":80,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0}}}}
+{"type":"assistant","timestamp":"2026-05-16T10:10:00.000Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":20,"cache_creation_input_tokens":2000,"cache_read_input_tokens":22000,"output_tokens":60,"cache_creation":{"ephemeral_1h_input_tokens":2000,"ephemeral_5m_input_tokens":0}}}}
+EOF
+
+read_session_cache_stats "$TRANSCRIPT"
+assert_eq "sess_reads"   "$sess_reads"   "40000"
+assert_eq "sess_writes"  "$sess_writes"  "7000"
+assert_eq "sess_inputs"  "$sess_inputs"  "170"
+assert_eq "last_1h_iso"  "$last_1h_iso"  "2026-05-16T10:10:00.000Z"
+assert_eq "last_5m_iso"  "$last_5m_iso"  ""
+
+read_session_cache_stats "/nonexistent/path.jsonl"
+assert_eq "missing file reads"  "$sess_reads"  "0"
+assert_eq "missing file writes" "$sess_writes" "0"
+
+read_session_cache_stats ""
+assert_eq "empty path reads"  "$sess_reads"  "0"
+
+rm -rf "$TMPDIR_TEST"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -109,6 +109,9 @@ iso_to_epoch() {
 
 # ── Extract JSON data ───────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
+model_id=$(echo "$input" | jq -r '.model.id // "claude-sonnet"')
+transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
+session_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // ""')
 
 size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
@@ -289,6 +292,7 @@ fi
 
 # ── Rate limit lines ────────────────────────────────────
 rate_lines=""
+cache_lines=""
 bar_width=10
 
 if [ -n "$five_hour_pct" ]; then
@@ -328,8 +332,239 @@ if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
     rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
 fi
 
+# ── Cache metrics functions ──────────────────────────────
+format_tokens() {
+    local n="${1:-0}"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if   [ "$n" -ge 1000000 ]; then awk -v n="$n" 'BEGIN{printf "%.1fM", n/1000000}'
+    elif [ "$n" -ge 1000 ];    then awk -v n="$n" 'BEGIN{printf "%.0fk", n/1000}'
+    else printf "%s" "$n"
+    fi
+}
+# Sets read_savings_rate and write_overhead_rate (USD per token, float)
+get_model_savings_rate() {
+    local model_id="${1:-claude-sonnet}"
+    local input_price cache_read_price cache_write_price
+    case "$model_id" in
+        claude-opus*)   input_price=15.00; cache_read_price=1.50;  cache_write_price=30.00 ;;
+        claude-haiku*)  input_price=0.80;  cache_read_price=0.08;  cache_write_price=1.60  ;;
+        claude-sonnet*) input_price=3.00;  cache_read_price=0.30;  cache_write_price=6.00  ;;
+        *)              input_price=3.00;  cache_read_price=0.30;  cache_write_price=6.00  ;;
+    esac
+    read_savings_rate=$(awk  -v i="$input_price" -v r="$cache_read_price"  'BEGIN{printf "%.8f",(i-r)/1000000}')
+    write_overhead_rate=$(awk -v w="$cache_write_price" -v i="$input_price" 'BEGIN{printf "%.8f",(w-i)/1000000}')
+}
+# Sets cache_ttl_str (e.g. "47m12s", "expired", "") and cache_ttl_pct (0-100)
+# Args: $1=last_write_iso  $2=ttl_seconds (300 for 5m-cache, 3600 for 1h-cache)
+compute_cache_ttl() {
+    local last_write_iso="$1" ttl_seconds="$2"
+    cache_ttl_str=""; cache_ttl_pct=0
+    [ -z "$last_write_iso" ] || [ "$last_write_iso" = "null" ] && return
+
+    local write_epoch now elapsed remaining
+    write_epoch=$(iso_to_epoch "$last_write_iso") || return
+    [ -z "$write_epoch" ] && return
+
+    now=$(date +%s)
+    elapsed=$(( now - write_epoch ))
+    remaining=$(( ttl_seconds - elapsed ))
+
+    if [ "$remaining" -le 0 ]; then
+        cache_ttl_str="expired"; cache_ttl_pct=0; return
+    fi
+
+    cache_ttl_pct=$(( remaining * 100 / ttl_seconds ))
+    [ "$cache_ttl_pct" -gt 100 ] && cache_ttl_pct=100
+
+    local h=$(( remaining / 3600 ))
+    local m=$(( (remaining % 3600) / 60 ))
+    local s=$(( remaining % 60 ))
+
+    if   [ "$h" -gt 0 ]; then cache_ttl_str=$(printf "%dh%02dm%02ds" "$h" "$m" "$s")
+    elif [ "$m" -gt 0 ]; then cache_ttl_str=$(printf "%dm%02ds" "$m" "$s")
+    else                       cache_ttl_str=$(printf "%ds" "$s")
+    fi
+}
+# Reads session cache stats from transcript JSONL.
+# Sets: sess_reads sess_writes sess_inputs last_5m_iso last_1h_iso
+read_session_cache_stats() {
+    local transcript="$1"
+    sess_reads=0; sess_writes=0; sess_inputs=0; last_5m_iso=""; last_1h_iso=""
+    [ -z "$transcript" ] || [ ! -f "$transcript" ] && return
+
+    local stats
+    stats=$(jq -s '{
+        reads:   ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+        writes:  ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+        inputs:  ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0),
+        last_5m: ([.[] | select(.type == "assistant" and ((.message.usage.cache_creation.ephemeral_5m_input_tokens // 0) > 0))] | last | .timestamp // ""),
+        last_1h: ([.[] | select(.type == "assistant" and ((.message.usage.cache_creation.ephemeral_1h_input_tokens // 0) > 0))] | last | .timestamp // "")
+    }' "$transcript" 2>/dev/null) || return
+
+    sess_reads=$(echo  "$stats" | jq -r '.reads   // 0')
+    sess_writes=$(echo "$stats" | jq -r '.writes  // 0')
+    sess_inputs=$(echo "$stats" | jq -r '.inputs  // 0')
+    last_5m_iso=$(echo "$stats" | jq -r '.last_5m // ""')
+    last_1h_iso=$(echo "$stats" | jq -r '.last_1h // ""')
+}
+# Scans all project JSONL files, uses 30s file cache at /tmp/claude/cache-all-stats.json.
+# Sets: all_reads all_writes all_inputs
+read_all_sessions_cache_stats() {
+    all_reads=0; all_writes=0; all_inputs=0
+
+    local cache_file="/tmp/claude/cache-all-stats.json"
+    local cache_max_age=30
+    local needs_refresh=true
+
+    mkdir -p /tmp/claude
+    if [ -f "$cache_file" ]; then
+        local cache_mtime now cache_age
+        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        cache_age=$(( now - cache_mtime ))
+        [ "$cache_age" -lt "$cache_max_age" ] && needs_refresh=false
+    fi
+
+    if $needs_refresh; then
+        local stats
+        set +f
+        stats=$(cat "$HOME/.claude/projects"/*/*.jsonl 2>/dev/null \
+            | timeout 10 jq -s '{
+                reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+                writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+                inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
+              }' 2>/dev/null)
+        set -f
+        [ -n "$stats" ] && echo "$stats" > "$cache_file"
+    fi
+
+    [ ! -f "$cache_file" ] && return
+    local data
+    data=$(cat "$cache_file" 2>/dev/null) || return
+    all_reads=$(echo  "$data" | jq -r '.reads  // 0')
+    all_writes=$(echo "$data" | jq -r '.writes // 0')
+    all_inputs=$(echo "$data" | jq -r '.inputs // 0')
+}
+# Assembles cache display lines (TTL bars + session + all-sessions rows).
+# Sets: cache_lines (multi-line string with ANSI codes)
+# Args: $1=transcript_path  $2=model_id  $3=session_cost_usd
+build_cache_lines() {
+    local transcript_path="$1" model_id="$2" session_cost="${3:-}"
+    local read_savings_rate write_overhead_rate
+    local sess_reads sess_writes sess_inputs last_5m_iso last_1h_iso
+    local all_reads all_writes all_inputs
+    local cache_ttl_str cache_ttl_pct
+    cache_lines=""
+
+    # Read session stats; if empty, skip entire section
+    read_session_cache_stats "$transcript_path"
+    [ "$sess_reads" -eq 0 ] && [ "$sess_writes" -eq 0 ] && [ "$sess_inputs" -eq 0 ] && return
+
+    get_model_savings_rate "$model_id"
+
+    # ── TTL lines ──────────────────────────────────────────
+    local ttl_lines=""
+    local both_tiers=false
+    [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ] && \
+    [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ] && both_tiers=true
+
+    if [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ]; then
+        compute_cache_ttl "$last_1h_iso" 3600
+        local lbl="cache   "
+        $both_tiers && lbl="1h-cache"
+        if [ "$cache_ttl_str" = "expired" ]; then
+            ttl_lines+="${white}${lbl}${reset} $(build_bar 0 10) ${red}expired${reset}\n"
+        elif [ -n "$cache_ttl_str" ]; then
+            local pct_color
+            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
+            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
+            local ttl_empty=$(( 10 - ttl_filled ))
+            local ttl_fs="" ttl_es="" ttl_i
+            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
+            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
+            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
+            ttl_lines+="${white}${lbl}${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
+        fi
+    fi
+
+    if [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ]; then
+        compute_cache_ttl "$last_5m_iso" 300
+        if [ "$cache_ttl_str" = "expired" ]; then
+            ttl_lines+="${white}5m-cache${reset} $(build_bar 0 10) ${red}expired${reset}\n"
+        elif [ -n "$cache_ttl_str" ]; then
+            local pct_color
+            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
+            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
+            local ttl_empty=$(( 10 - ttl_filled ))
+            local ttl_fs="" ttl_es="" ttl_i
+            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
+            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
+            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
+            ttl_lines+="${white}5m-cache${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
+        fi
+    fi
+
+    # ── Session stats line ─────────────────────────────────
+    local r_fmt w_fmt hit_pct net_usd net_abs net_sign net_color
+    r_fmt=$(format_tokens "$sess_reads")
+    w_fmt=$(format_tokens "$sess_writes")
+
+    local denom=$(( sess_inputs + sess_reads ))
+    [ "$denom" -gt 0 ] && hit_pct=$(( sess_reads * 100 / denom )) || hit_pct=0
+
+    net_usd=$(awk -v r="$sess_reads" -v w="$sess_writes" \
+              -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
+              'BEGIN{printf "%.4f", r*rs - w*wo}')
+    net_abs=$(awk -v n="$net_usd" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    if awk -v n="$net_usd" 'BEGIN{exit !(n >= 0)}'; then
+        net_sign="+"; net_color="$green"
+    else
+        net_sign="-"; net_color="$red"
+    fi
+
+    local cost_part=""
+    if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && \
+       awk -v c="$session_cost" 'BEGIN{exit !(c+0 > 0)}'; then
+        cost_part="  ${dim}cost${reset} ${white}$(printf '$%.4f' "$session_cost")${reset}"
+    fi
+
+    local sess_line="${white}session${reset}  "
+    sess_line+="${dim}r:${reset}${white}${r_fmt}${reset}  ${dim}w:${reset}${white}${w_fmt}${reset}  "
+    sess_line+="${dim}hit:${reset}${white}${hit_pct}%${reset}  "
+    sess_line+="${dim}net${reset} ${net_color}${net_sign}\$${net_abs}${reset}${cost_part}"
+
+    # ── All-sessions stats line ────────────────────────────
+    read_all_sessions_cache_stats
+    local ar_fmt aw_fmt all_hit all_net all_abs all_sign all_color
+    ar_fmt=$(format_tokens "$all_reads")
+    aw_fmt=$(format_tokens "$all_writes")
+
+    local all_denom=$(( all_inputs + all_reads ))
+    [ "$all_denom" -gt 0 ] && all_hit=$(( all_reads * 100 / all_denom )) || all_hit=0
+
+    all_net=$(awk -v r="$all_reads" -v w="$all_writes" \
+              -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
+              'BEGIN{printf "%.4f", r*rs - w*wo}')
+    all_abs=$(awk -v n="$all_net" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    if awk -v n="$all_net" 'BEGIN{exit !(n >= 0)}'; then
+        all_sign="+"; all_color="$green"
+    else
+        all_sign="-"; all_color="$red"
+    fi
+
+    local all_line="${white}all${reset}      "
+    all_line+="${dim}r:${reset}${white}${ar_fmt}${reset}  ${dim}w:${reset}${white}${aw_fmt}${reset}  "
+    all_line+="${dim}hit:${reset}${white}${all_hit}%${reset}  "
+    all_line+="${dim}net${reset} ${all_color}${all_sign}\$${all_abs}${reset}"
+
+    cache_lines="${ttl_lines}${sess_line}\n${all_line}"
+}
+# ── End cache metrics functions ──────────────────────────
+
 # ── Output ──────────────────────────────────────────────
+build_cache_lines "$transcript_path" "$model_id" "$session_cost"
 printf "%b" "$line1"
 [ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"
+[ -n "$cache_lines" ] && printf "\n%b" "$cache_lines"
 
 exit 0

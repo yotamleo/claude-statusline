@@ -328,6 +328,17 @@ if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
     rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
 fi
 
+# ── Cache metrics functions ──────────────────────────────
+format_tokens() {
+    local n="${1:-0}"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if   [ "$n" -ge 1000000 ]; then awk -v n="$n" 'BEGIN{printf "%.1fM", n/1000000}'
+    elif [ "$n" -ge 1000 ];    then awk -v n="$n" 'BEGIN{printf "%.0fk", n/1000}'
+    else printf "%s" "$n"
+    fi
+}
+# ── End cache metrics functions ──────────────────────────
+
 # ── Output ──────────────────────────────────────────────
 printf "%b" "$line1"
 [ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"

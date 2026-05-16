@@ -427,12 +427,14 @@ read_all_sessions_cache_stats() {
 
     if $needs_refresh; then
         local stats
+        set +f
         stats=$(cat "$HOME/.claude/projects"/*/*.jsonl 2>/dev/null \
             | timeout 10 jq -s '{
                 reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
                 writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
                 inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
               }' 2>/dev/null)
+        set -f
         [ -n "$stats" ] && echo "$stats" > "$cache_file"
     fi
 

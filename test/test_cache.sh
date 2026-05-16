@@ -178,5 +178,38 @@ assert_eq "all_inputs" "$all_inputs" "250"
 
 rm -rf "$TMPDIR_ALL"
 
+# ── build_cache_lines integration test ────────────────────
+TMPDIR_BL=$(mktemp -d)
+BL_TRANSCRIPT="$TMPDIR_BL/sess.jsonl"
+NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+cat > "$BL_TRANSCRIPT" <<EOF
+{"type":"assistant","timestamp":"${NOW_ISO}","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"cache_creation_input_tokens":5000,"cache_read_input_tokens":20000,"output_tokens":50,"cache_creation":{"ephemeral_1h_input_tokens":5000,"ephemeral_5m_input_tokens":0}}}}
+EOF
+
+mkdir -p "$TMPDIR_BL/.claude/projects/test"
+cp "$BL_TRANSCRIPT" "$TMPDIR_BL/.claude/projects/test/sess.jsonl"
+rm -f /tmp/claude/cache-all-stats.json
+
+HOME="$TMPDIR_BL" build_cache_lines "$BL_TRANSCRIPT" "claude-sonnet-4-6" "0.05"
+
+# Strip ANSI codes for assertion
+plain=$(printf "%b" "$cache_lines" | sed 's/\x1b\[[0-9;]*m//g')
+
+echo "$plain" | grep -q "session" && { echo "PASS: session line present"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: session line missing"; FAIL=$(( FAIL + 1 )); }
+echo "$plain" | grep -q "r:20k" && { echo "PASS: reads shown as 20k"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: reads not 20k in: $plain"; FAIL=$(( FAIL + 1 )); }
+echo "$plain" | grep -q "w:5k" && { echo "PASS: writes shown as 5k"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: writes not 5k"; FAIL=$(( FAIL + 1 )); }
+echo "$plain" | grep -q "hit:" && { echo "PASS: hit rate present"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: hit rate missing"; FAIL=$(( FAIL + 1 )); }
+echo "$plain" | grep -q "cache" && { echo "PASS: TTL line present"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: TTL line missing"; FAIL=$(( FAIL + 1 )); }
+echo "$plain" | grep -q "cost" && { echo "PASS: cost present"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: cost missing"; FAIL=$(( FAIL + 1 )); }
+
+rm -rf "$TMPDIR_BL"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

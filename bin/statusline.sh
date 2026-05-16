@@ -439,6 +439,108 @@ read_all_sessions_cache_stats() {
     all_writes=$(echo "$data" | jq -r '.writes // 0')
     all_inputs=$(echo "$data" | jq -r '.inputs // 0')
 }
+# Assembles cache display lines (TTL bars + session + all-sessions rows).
+# Sets: cache_lines (multi-line string with ANSI codes)
+# Args: $1=transcript_path  $2=model_id  $3=session_cost_usd
+build_cache_lines() {
+    local transcript_path="$1" model_id="$2" session_cost="${3:-}"
+    local read_savings_rate write_overhead_rate
+    local sess_reads sess_writes sess_inputs last_5m_iso last_1h_iso
+    local all_reads all_writes all_inputs
+    local cache_ttl_str cache_ttl_pct
+    cache_lines=""
+
+    # Read session stats; if empty, skip entire section
+    read_session_cache_stats "$transcript_path"
+    [ "$sess_reads" -eq 0 ] && [ "$sess_writes" -eq 0 ] && [ "$sess_inputs" -eq 0 ] && return
+
+    get_model_savings_rate "$model_id"
+
+    # ── TTL lines ──────────────────────────────────────────
+    local ttl_lines=""
+    local both_tiers=false
+    [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ] && \
+    [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ] && both_tiers=true
+
+    if [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ]; then
+        compute_cache_ttl "$last_1h_iso" 3600
+        local lbl="cache   "
+        $both_tiers && lbl="1h-cache"
+        if [ "$cache_ttl_str" = "expired" ]; then
+            ttl_lines+="${white}${lbl}${reset} $(build_bar 0 10) ${red}expired${reset}\n"
+        elif [ -n "$cache_ttl_str" ]; then
+            local pct_color
+            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
+            ttl_lines+="${white}${lbl}${reset} $(build_bar "$cache_ttl_pct" 10) ${pct_color}${cache_ttl_str}${reset}\n"
+        fi
+    fi
+
+    if [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ]; then
+        compute_cache_ttl "$last_5m_iso" 300
+        if [ "$cache_ttl_str" = "expired" ]; then
+            ttl_lines+="${white}5m-cache${reset} $(build_bar 0 10) ${red}expired${reset}\n"
+        elif [ -n "$cache_ttl_str" ]; then
+            local pct_color
+            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
+            ttl_lines+="${white}5m-cache${reset} $(build_bar "$cache_ttl_pct" 10) ${pct_color}${cache_ttl_str}${reset}\n"
+        fi
+    fi
+
+    # ── Session stats line ─────────────────────────────────
+    local r_fmt w_fmt hit_pct net_usd net_abs net_sign net_color
+    r_fmt=$(format_tokens "$sess_reads")
+    w_fmt=$(format_tokens "$sess_writes")
+
+    local denom=$(( sess_inputs + sess_reads ))
+    [ "$denom" -gt 0 ] && hit_pct=$(( sess_reads * 100 / denom )) || hit_pct=0
+
+    net_usd=$(awk -v r="$sess_reads" -v w="$sess_writes" \
+              -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
+              'BEGIN{printf "%.4f", r*rs - w*wo}')
+    net_abs=$(awk -v n="$net_usd" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    if awk -v n="$net_usd" 'BEGIN{exit !(n >= 0)}'; then
+        net_sign="+"; net_color="$green"
+    else
+        net_sign="-"; net_color="$red"
+    fi
+
+    local cost_part=""
+    if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && \
+       awk -v c="$session_cost" 'BEGIN{exit !(c+0 > 0)}'; then
+        cost_part="  ${dim}cost${reset} ${white}$(printf '$%.4f' "$session_cost")${reset}"
+    fi
+
+    local sess_line="${white}session${reset}  "
+    sess_line+="${dim}r:${reset}${white}${r_fmt}${reset}  ${dim}w:${reset}${white}${w_fmt}${reset}  "
+    sess_line+="${dim}hit:${reset}${white}${hit_pct}%${reset}  "
+    sess_line+="${dim}net${reset} ${net_color}${net_sign}\$${net_abs}${reset}${cost_part}"
+
+    # ── All-sessions stats line ────────────────────────────
+    read_all_sessions_cache_stats
+    local ar_fmt aw_fmt all_hit all_net all_abs all_sign all_color
+    ar_fmt=$(format_tokens "$all_reads")
+    aw_fmt=$(format_tokens "$all_writes")
+
+    local all_denom=$(( all_inputs + all_reads ))
+    [ "$all_denom" -gt 0 ] && all_hit=$(( all_reads * 100 / all_denom )) || all_hit=0
+
+    all_net=$(awk -v r="$all_reads" -v w="$all_writes" \
+              -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
+              'BEGIN{printf "%.4f", r*rs - w*wo}')
+    all_abs=$(awk -v n="$all_net" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    if awk -v n="$all_net" 'BEGIN{exit !(n >= 0)}'; then
+        all_sign="+"; all_color="$green"
+    else
+        all_sign="-"; all_color="$red"
+    fi
+
+    local all_line="${white}all${reset}      "
+    all_line+="${dim}r:${reset}${white}${ar_fmt}${reset}  ${dim}w:${reset}${white}${aw_fmt}${reset}  "
+    all_line+="${dim}hit:${reset}${white}${all_hit}%${reset}  "
+    all_line+="${dim}net${reset} ${all_color}${all_sign}\$${all_abs}${reset}"
+
+    cache_lines="${ttl_lines}${sess_line}\n${all_line}"
+}
 # ── End cache metrics functions ──────────────────────────
 
 # ── Output ──────────────────────────────────────────────

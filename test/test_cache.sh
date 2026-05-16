@@ -46,6 +46,9 @@ build_bar() {
 
 # ── Source cache functions from statusline.sh ──────────────
 eval "$(sed -n '/^# ── Cache metrics functions/,/^# ── End cache metrics functions/p' "$STATUSLINE")"
+if ! declare -f format_tokens >/dev/null 2>&1; then
+    echo "ERROR: failed to source cache functions from $STATUSLINE" >&2; exit 1
+fi
 
 # ── Test framework ─────────────────────────────────────────
 PASS=0; FAIL=0

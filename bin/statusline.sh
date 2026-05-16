@@ -475,7 +475,13 @@ build_cache_lines() {
         elif [ -n "$cache_ttl_str" ]; then
             local pct_color
             pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
-            ttl_lines+="${white}${lbl}${reset} $(build_bar "$cache_ttl_pct" 10) ${pct_color}${cache_ttl_str}${reset}\n"
+            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
+            local ttl_empty=$(( 10 - ttl_filled ))
+            local ttl_fs="" ttl_es="" ttl_i
+            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
+            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
+            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
+            ttl_lines+="${white}${lbl}${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
         fi
     fi
 
@@ -486,7 +492,13 @@ build_cache_lines() {
         elif [ -n "$cache_ttl_str" ]; then
             local pct_color
             pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
-            ttl_lines+="${white}5m-cache${reset} $(build_bar "$cache_ttl_pct" 10) ${pct_color}${cache_ttl_str}${reset}\n"
+            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
+            local ttl_empty=$(( 10 - ttl_filled ))
+            local ttl_fs="" ttl_es="" ttl_i
+            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
+            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
+            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
+            ttl_lines+="${white}5m-cache${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
         fi
     fi
 

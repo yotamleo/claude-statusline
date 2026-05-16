@@ -168,8 +168,10 @@ cat > "$TMPDIR_ALL/.claude/projects/proj-b/sess2.jsonl" <<'EOF'
 {"type":"assistant","timestamp":"2026-05-16T10:00:00.000Z","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":3000,"cache_read_input_tokens":30000,"output_tokens":40}}}
 EOF
 
-# Delete any stale /tmp/claude/cache-all-stats.json so we force a refresh
-rm -f /tmp/claude/cache-all-stats.json
+# Pre-populate cache file with known data (tests the cache-read path;
+# background refresh is async so we can't assert on a cold-cache write in tests)
+mkdir -p /tmp/claude
+echo '{"reads":35000,"writes":13000,"inputs":250}' > /tmp/claude/cache-all-stats.json
 
 HOME="$TMPDIR_ALL" read_all_sessions_cache_stats
 assert_eq "all_reads"  "$all_reads"  "35000"

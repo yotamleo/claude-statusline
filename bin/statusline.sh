@@ -426,18 +426,19 @@ read_all_sessions_cache_stats() {
     fi
 
     if $needs_refresh; then
-        local stats
-        set +f
-        stats=$(cat "$HOME/.claude/projects"/*/*.jsonl 2>/dev/null \
-            | timeout 10 jq -s '{
-                reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
-                writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
-                inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
-              }' 2>/dev/null)
-        set -f
-        [ -n "$stats" ] && echo "$stats" > "$cache_file"
+        local _cf="$cache_file" _home="$HOME"
+        ( set +f
+          _s=$(cat "$_home/.claude/projects"/*/*.jsonl 2>/dev/null \
+              | timeout 10 jq -s '{
+                  reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+                  writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+                  inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
+                }' 2>/dev/null)
+          [ -n "$_s" ] && echo "$_s" > "$_cf"
+        ) & disown 2>/dev/null || true
     fi
 
+    # Return last cached value immediately (may be one render stale during refresh)
     [ ! -f "$cache_file" ] && return
     local data
     data=$(cat "$cache_file" 2>/dev/null) || return
@@ -456,10 +457,7 @@ build_cache_lines() {
     local cache_ttl_str cache_ttl_pct
     cache_lines=""
 
-    # Read session stats; if empty, skip entire section
     read_session_cache_stats "$transcript_path"
-    [ "$sess_reads" -eq 0 ] && [ "$sess_writes" -eq 0 ] && [ "$sess_inputs" -eq 0 ] && return
-
     get_model_savings_rate "$model_id"
 
     # ── TTL lines ──────────────────────────────────────────

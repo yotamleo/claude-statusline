@@ -346,10 +346,10 @@ get_model_savings_rate() {
     local model_id="${1:-claude-sonnet}"
     local input_price cache_read_price cache_write_price
     case "$model_id" in
-        claude-opus*)   input_price=15.00; cache_read_price=1.50;  cache_write_price=18.75 ;;
-        claude-haiku*)  input_price=0.80;  cache_read_price=0.08;  cache_write_price=1.00  ;;
-        claude-sonnet*) input_price=3.00;  cache_read_price=0.30;  cache_write_price=3.75  ;;
-        *)              input_price=3.00;  cache_read_price=0.30;  cache_write_price=3.75  ;;
+        claude-opus*)   input_price=15.00; cache_read_price=1.50;  cache_write_price=30.00 ;;
+        claude-haiku*)  input_price=0.80;  cache_read_price=0.08;  cache_write_price=1.60  ;;
+        claude-sonnet*) input_price=3.00;  cache_read_price=0.30;  cache_write_price=6.00  ;;
+        *)              input_price=3.00;  cache_read_price=0.30;  cache_write_price=6.00  ;;
     esac
     read_savings_rate=$(awk  -v i="$input_price" -v r="$cache_read_price"  'BEGIN{printf "%.8f",(i-r)/1000000}')
     write_overhead_rate=$(awk -v w="$cache_write_price" -v i="$input_price" 'BEGIN{printf "%.8f",(w-i)/1000000}')

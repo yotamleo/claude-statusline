@@ -74,15 +74,15 @@ assert_eq "format bad"     "$(format_tokens abc)"     "0"
 # ── get_model_savings_rate tests ───────────────────────────
 get_model_savings_rate "claude-sonnet-4-6"
 assert_eq "sonnet read_savings_rate"   "$read_savings_rate"   "0.00000270"
-assert_eq "sonnet write_overhead_rate" "$write_overhead_rate" "0.00000075"
+assert_eq "sonnet write_overhead_rate" "$write_overhead_rate" "0.00000300"
 
 get_model_savings_rate "claude-opus-4-7"
 assert_eq "opus read_savings_rate"     "$read_savings_rate"   "0.00001350"
-assert_eq "opus write_overhead_rate"   "$write_overhead_rate" "0.00000375"
+assert_eq "opus write_overhead_rate"   "$write_overhead_rate" "0.00001500"
 
 get_model_savings_rate "claude-haiku-4-5"
 assert_eq "haiku read_savings_rate"    "$read_savings_rate"   "0.00000072"
-assert_eq "haiku write_overhead_rate"  "$write_overhead_rate" "0.00000020"
+assert_eq "haiku write_overhead_rate"  "$write_overhead_rate" "0.00000080"
 
 get_model_savings_rate "unknown-model"
 assert_eq "fallback read_savings_rate" "$read_savings_rate"   "0.00000270"

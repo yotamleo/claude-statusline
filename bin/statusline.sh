@@ -403,6 +403,42 @@ read_session_cache_stats() {
     last_5m_iso=$(echo "$stats" | jq -r '.last_5m // ""')
     last_1h_iso=$(echo "$stats" | jq -r '.last_1h // ""')
 }
+# Scans all project JSONL files, uses 30s file cache at /tmp/claude/cache-all-stats.json.
+# Sets: all_reads all_writes all_inputs
+read_all_sessions_cache_stats() {
+    all_reads=0; all_writes=0; all_inputs=0
+
+    local cache_file="/tmp/claude/cache-all-stats.json"
+    local cache_max_age=30
+    local needs_refresh=true
+
+    mkdir -p /tmp/claude
+    if [ -f "$cache_file" ]; then
+        local cache_mtime now cache_age
+        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        cache_age=$(( now - cache_mtime ))
+        [ "$cache_age" -lt "$cache_max_age" ] && needs_refresh=false
+    fi
+
+    if $needs_refresh; then
+        local stats
+        stats=$(cat "$HOME/.claude/projects"/*/*.jsonl 2>/dev/null \
+            | timeout 10 jq -s '{
+                reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+                writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+                inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
+              }' 2>/dev/null)
+        [ -n "$stats" ] && echo "$stats" > "$cache_file"
+    fi
+
+    [ ! -f "$cache_file" ] && return
+    local data
+    data=$(cat "$cache_file" 2>/dev/null) || return
+    all_reads=$(echo  "$data" | jq -r '.reads  // 0')
+    all_writes=$(echo "$data" | jq -r '.writes // 0')
+    all_inputs=$(echo "$data" | jq -r '.inputs // 0')
+}
 # ── End cache metrics functions ──────────────────────────
 
 # ── Output ──────────────────────────────────────────────

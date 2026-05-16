@@ -157,5 +157,26 @@ assert_eq "empty path reads"  "$sess_reads"  "0"
 
 rm -rf "$TMPDIR_TEST"
 
+# ── read_all_sessions_cache_stats tests ───────────────────
+TMPDIR_ALL=$(mktemp -d)
+
+mkdir -p "$TMPDIR_ALL/.claude/projects/proj-a" "$TMPDIR_ALL/.claude/projects/proj-b"
+cat > "$TMPDIR_ALL/.claude/projects/proj-a/sess1.jsonl" <<'EOF'
+{"type":"assistant","timestamp":"2026-05-16T09:00:00.000Z","message":{"usage":{"input_tokens":200,"cache_creation_input_tokens":10000,"cache_read_input_tokens":5000,"output_tokens":100}}}
+EOF
+cat > "$TMPDIR_ALL/.claude/projects/proj-b/sess2.jsonl" <<'EOF'
+{"type":"assistant","timestamp":"2026-05-16T10:00:00.000Z","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":3000,"cache_read_input_tokens":30000,"output_tokens":40}}}
+EOF
+
+# Delete any stale /tmp/claude/cache-all-stats.json so we force a refresh
+rm -f /tmp/claude/cache-all-stats.json
+
+HOME="$TMPDIR_ALL" read_all_sessions_cache_stats
+assert_eq "all_reads"  "$all_reads"  "35000"
+assert_eq "all_writes" "$all_writes" "13000"
+assert_eq "all_inputs" "$all_inputs" "250"
+
+rm -rf "$TMPDIR_ALL"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

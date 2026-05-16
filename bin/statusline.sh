@@ -292,6 +292,7 @@ fi
 
 # ── Rate limit lines ────────────────────────────────────
 rate_lines=""
+cache_lines=""
 bar_width=10
 
 if [ -n "$five_hour_pct" ]; then

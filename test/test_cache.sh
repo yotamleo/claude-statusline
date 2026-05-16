@@ -87,5 +87,48 @@ assert_eq "haiku write_overhead_rate"  "$write_overhead_rate" "0.00000020"
 get_model_savings_rate "unknown-model"
 assert_eq "fallback read_savings_rate" "$read_savings_rate"   "0.00000270"
 
+# ── compute_cache_ttl tests ────────────────────────────────
+NOW=$(date +%s)
+
+# 1h cache: wrote 30 minutes ago → ~30m remaining, pct ~50%
+WROTE_30M_AGO=$(date -d "@$(( NOW - 1800 ))" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r $(( NOW - 1800 )) +"%Y-%m-%dT%H:%M:%SZ")
+compute_cache_ttl "$WROTE_30M_AGO" 3600
+if [ "$cache_ttl_pct" -ge 45 ] && [ "$cache_ttl_pct" -le 55 ]; then
+    echo "PASS: 1h cache 30m ago pct ~50% (got ${cache_ttl_pct}%)"; PASS=$(( PASS + 1 ))
+else
+    echo "FAIL: 1h cache 30m ago pct want 45-55%, got ${cache_ttl_pct}%"; FAIL=$(( FAIL + 1 ))
+fi
+if [ "$cache_ttl_str" != "expired" ] && [ -n "$cache_ttl_str" ]; then
+    echo "PASS: 1h cache 30m ago not expired (got $cache_ttl_str)"; PASS=$(( PASS + 1 ))
+else
+    echo "FAIL: 1h cache 30m ago should not be expired, got '$cache_ttl_str'"; FAIL=$(( FAIL + 1 ))
+fi
+
+# 5m cache: wrote 6 minutes ago → expired
+WROTE_6M_AGO=$(date -d "@$(( NOW - 360 ))" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r $(( NOW - 360 )) +"%Y-%m-%dT%H:%M:%SZ")
+compute_cache_ttl "$WROTE_6M_AGO" 300
+assert_eq "5m cache expired str" "$cache_ttl_str" "expired"
+assert_eq "5m cache expired pct" "$cache_ttl_pct" "0"
+
+# Empty ISO → silent skip (str stays empty)
+compute_cache_ttl "" 3600
+assert_eq "empty iso: ttl_str empty" "$cache_ttl_str" ""
+
+# "null" ISO → silent skip
+compute_cache_ttl "null" 3600
+assert_eq "null iso: ttl_str empty" "$cache_ttl_str" ""
+
+# Fresh write (2s ago) → pct >= 99
+WROTE_2S_AGO=$(date -d "@$(( NOW - 2 ))" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r $(( NOW - 2 )) +"%Y-%m-%dT%H:%M:%SZ")
+compute_cache_ttl "$WROTE_2S_AGO" 3600
+if [ "$cache_ttl_pct" -ge 99 ]; then
+    echo "PASS: fresh 1h write pct>=99 (got ${cache_ttl_pct}%)"; PASS=$(( PASS + 1 ))
+else
+    echo "FAIL: fresh write want pct>=99, got ${cache_ttl_pct}%"; FAIL=$(( FAIL + 1 ))
+fi
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -350,6 +350,37 @@ get_model_savings_rate() {
     read_savings_rate=$(awk  -v i="$input_price" -v r="$cache_read_price"  'BEGIN{printf "%.8f",(i-r)/1000000}')
     write_overhead_rate=$(awk -v w="$cache_write_price" -v i="$input_price" 'BEGIN{printf "%.8f",(w-i)/1000000}')
 }
+# Sets cache_ttl_str (e.g. "47m12s", "expired", "") and cache_ttl_pct (0-100)
+# Args: $1=last_write_iso  $2=ttl_seconds (300 for 5m-cache, 3600 for 1h-cache)
+compute_cache_ttl() {
+    local last_write_iso="$1" ttl_seconds="$2"
+    cache_ttl_str=""; cache_ttl_pct=0
+    [ -z "$last_write_iso" ] || [ "$last_write_iso" = "null" ] && return
+
+    local write_epoch now elapsed remaining
+    write_epoch=$(iso_to_epoch "$last_write_iso") || return
+    [ -z "$write_epoch" ] && return
+
+    now=$(date +%s)
+    elapsed=$(( now - write_epoch ))
+    remaining=$(( ttl_seconds - elapsed ))
+
+    if [ "$remaining" -le 0 ]; then
+        cache_ttl_str="expired"; cache_ttl_pct=0; return
+    fi
+
+    cache_ttl_pct=$(( remaining * 100 / ttl_seconds ))
+    [ "$cache_ttl_pct" -gt 100 ] && cache_ttl_pct=100
+
+    local h=$(( remaining / 3600 ))
+    local m=$(( (remaining % 3600) / 60 ))
+    local s=$(( remaining % 60 ))
+
+    if   [ "$h" -gt 0 ]; then cache_ttl_str=$(printf "%dh%02dm%02ds" "$h" "$m" "$s")
+    elif [ "$m" -gt 0 ]; then cache_ttl_str=$(printf "%dm%02ds" "$m" "$s")
+    else                       cache_ttl_str=$(printf "%ds" "$s")
+    fi
+}
 # ── End cache metrics functions ──────────────────────────
 
 # ── Output ──────────────────────────────────────────────

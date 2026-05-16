@@ -71,5 +71,21 @@ assert_eq "format 1234567" "$(format_tokens 1234567)" "1.2M"
 assert_eq "format empty"   "$(format_tokens '')"      "0"
 assert_eq "format bad"     "$(format_tokens abc)"     "0"
 
+# ── get_model_savings_rate tests ───────────────────────────
+get_model_savings_rate "claude-sonnet-4-6"
+assert_eq "sonnet read_savings_rate"   "$read_savings_rate"   "0.00000270"
+assert_eq "sonnet write_overhead_rate" "$write_overhead_rate" "0.00000075"
+
+get_model_savings_rate "claude-opus-4-7"
+assert_eq "opus read_savings_rate"     "$read_savings_rate"   "0.00001350"
+assert_eq "opus write_overhead_rate"   "$write_overhead_rate" "0.00000375"
+
+get_model_savings_rate "claude-haiku-4-5"
+assert_eq "haiku read_savings_rate"    "$read_savings_rate"   "0.00000072"
+assert_eq "haiku write_overhead_rate"  "$write_overhead_rate" "0.00000020"
+
+get_model_savings_rate "unknown-model"
+assert_eq "fallback read_savings_rate" "$read_savings_rate"   "0.00000270"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

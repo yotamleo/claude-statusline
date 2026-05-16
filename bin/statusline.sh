@@ -109,6 +109,9 @@ iso_to_epoch() {
 
 # ── Extract JSON data ───────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
+model_id=$(echo "$input" | jq -r '.model.id // "claude-sonnet"')
+transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
+session_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // ""')
 
 size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
@@ -544,7 +547,9 @@ build_cache_lines() {
 # ── End cache metrics functions ──────────────────────────
 
 # ── Output ──────────────────────────────────────────────
+build_cache_lines "$transcript_path" "$model_id" "$session_cost"
 printf "%b" "$line1"
 [ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"
+[ -n "$cache_lines" ] && printf "\n%b" "$cache_lines"
 
 exit 0

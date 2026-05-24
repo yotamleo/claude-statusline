@@ -39,7 +39,12 @@ Stages currently wired:
 `.gitattributes` forces LF for all shell scripts. CRLF in bash scripts
 breaks on Linux/macOS (literal `\r` characters get embedded in variable
 values and ANSI escape sequences). The `mixed-line-ending` pre-commit
-hook re-fixes any CRLF that slips back in.
+hook rewrites CRLF to LF on commit *and fails the commit on first hit*
+— you have to `git add` the corrected file and re-commit.
+
+**Windows operators:** set `git config --global core.autocrlf false`
+before cloning, otherwise git's smudge filter will re-CRLF the working
+tree after each checkout and fight the pre-commit hook every commit.
 
 ## Upstream sync
 

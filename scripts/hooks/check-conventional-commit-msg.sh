@@ -15,7 +15,16 @@ if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
     exit 1
 fi
 
-subject=$(sed -n '1p' "$msg_file")
+# Strip comment lines (git's default --cleanup=strip removes them before
+# storing the commit, but --cleanup=verbatim does not — so a `#`-prefixed
+# line could otherwise land as the subject).
+cleaned=$(git stripspace --strip-comments < "$msg_file") || cleaned=$(cat "$msg_file")
+
+# Strip trailing CR — Windows editors that produce CRLF would otherwise
+# leave \r in the subject, breaking both the Merge/Revert passthrough
+# and any downstream tooling that parses the subject line.
+subject=$(printf '%s' "$cleaned" | sed -n '1p')
+subject="${subject%$'\r'}"
 
 # Skip auto-generated merge/revert commits — git creates these and they
 # don't follow Conventional Commits.

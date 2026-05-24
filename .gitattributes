@@ -1,0 +1,15 @@
+# Shell scripts must use LF endings — CRLF breaks bash on Linux/macOS
+# (literal \r characters become part of variable values, ANSI escapes, etc.).
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Ensure consistent line endings for other plaintext
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.js    text eol=lf
+
+# Binary
+*.png   binary
+*.jpg   binary

@@ -1,0 +1,52 @@
+# Pre-commit framework config for yotamleo/claude-statusline fork.
+# Mirrors the protection layer used in github.com/yotamleo/himmel — generic
+# hooks only (no project-specific guards). Install once after clone:
+#
+#     pip install pre-commit && pre-commit install --hook-type pre-commit \
+#         --hook-type commit-msg --hook-type pre-push
+#
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=error]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: worktree-isolation
+        name: Block commits on main
+        language: system
+        entry: bash scripts/hooks/check-worktree-isolation.sh
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: conventional-commit-msg
+        name: Conventional commit message
+        language: system
+        entry: bash scripts/hooks/check-conventional-commit-msg.sh
+        stages: [commit-msg]
+
+      - id: no-push-to-main
+        name: Block direct push to main
+        language: system
+        entry: bash scripts/hooks/check-push-target.sh
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

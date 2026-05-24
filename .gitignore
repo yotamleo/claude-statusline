@@ -1,2 +1,11 @@
 node_modules
 .DS_Store
+
+# Claude Code worktrees (per fork convention — never commit feature-branch worktrees)
+/.claude/worktrees
+/.claude/settings.local.json
+
+# Secrets / env
+.env
+.env.*
+!.env.example

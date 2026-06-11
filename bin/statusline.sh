@@ -115,7 +115,7 @@ epoch_to_iso() {
         # Pass through only if it already looks ISO-shaped; anything else
         # (fractional epochs, garbage) would leak a non-ISO resets_at into
         # the cache schema — emit nothing so the caller stores null.
-        [[ "$epoch" =~ ^[0-9]{4}- ]] && printf "%s" "$epoch"
+        [[ "$epoch" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] && printf "%s" "$epoch"
         return
     fi
 
@@ -123,6 +123,18 @@ epoch_to_iso() {
     iso=$(date -u -d "@${epoch}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
     [ -z "$iso" ] && iso=$(date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
     printf "%s" "$iso"
+}
+
+# Append a one-line failure breadcrumb to the debug log. Capped at ~100KB
+# (truncate-on-overflow) because the failure modes it logs repeat every
+# render — a stuck mv on the shared cache must not fill /tmp over a long
+# session. Known blind spot: if /tmp/claude itself is unwritable, the
+# cache write AND this breadcrumb vanish together — there is nowhere
+# else for a statusline to report, so the log is not a complete record.
+cache_breadcrumb() {
+    local log="/tmp/claude/statusline-debug.log"
+    [ -f "$log" ] && [ "$(wc -c < "$log" 2>/dev/null || echo 0)" -gt 100000 ] && : > "$log"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) cache-write failed: $1" >> "$log" 2>/dev/null
 }
 
 # ── Extract JSON data ───────────────────────────────────
@@ -286,9 +298,15 @@ if ! $has_stdin_rates; then
                 # Atomic tmp+mv — a reader hitting a torn write would treat
                 # the cache as corrupt and silently drop extra_usage.
                 tmp_cache="${cache_file}.$$.tmp"
+                api_write_fail=""
                 if echo "$response" > "$tmp_cache" 2>/dev/null; then
-                    mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache"
+                    mv -f "$tmp_cache" "$cache_file" 2>/dev/null \
+                        || { rm -f "$tmp_cache" 2>/dev/null; api_write_fail="api-mv"; }
+                else
+                    rm -f "$tmp_cache" 2>/dev/null
+                    api_write_fail="api-tmp-write"
                 fi
+                [ -n "$api_write_fail" ] && cache_breadcrumb "$api_write_fail"
             fi
         fi
         if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
@@ -366,9 +384,7 @@ else
         fi
         # Breadcrumb on failure — otherwise "no write" here is field-
         # indistinguishable from the frozen-cache bug this branch fixes.
-        [ -n "$write_fail" ] && \
-            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) stdin-cache-write failed: ${write_fail}" \
-                >> /tmp/claude/statusline-debug.log 2>/dev/null
+        [ -n "$write_fail" ] && cache_breadcrumb "stdin-${write_fail}"
     fi
 fi
 

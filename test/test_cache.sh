@@ -213,5 +213,37 @@ echo "$plain" | grep -q "cost" && { echo "PASS: cost present"; PASS=$(( PASS + 1
 
 rm -rf "$TMPDIR_BL"
 
+# ── stdin rate_limits → usage cache write (regression) ────
+# Bug: the only usage-cache write lived in the API-fallback branch, so the
+# cache froze for the whole session once stdin carried rate_limits.
+USAGE_CACHE=/tmp/claude/statusline-usage-cache.json
+USAGE_BACKUP=$(mktemp)
+[ -f "$USAGE_CACHE" ] && cp "$USAGE_CACHE" "$USAGE_BACKUP"
+
+rm -f "$USAGE_CACHE"
+RESET_EPOCH=$(( NOW + 7200 ))
+printf '{"model":{"display_name":"T","id":"claude-sonnet-4-6"},"cwd":"/tmp","rate_limits":{"five_hour":{"used_percentage":42.7,"resets_at":%s},"seven_day":{"used_percentage":63.2,"resets_at":%s}}}' \
+    "$RESET_EPOCH" "$RESET_EPOCH" | bash "$STATUSLINE" >/dev/null 2>&1
+
+if [ -f "$USAGE_CACHE" ]; then
+    assert_eq "stdin rates: five_hour.utilization cached" \
+        "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "42.7"
+    assert_eq "stdin rates: seven_day.utilization cached" \
+        "$(jq -r '.seven_day.utilization' "$USAGE_CACHE")" "63.2"
+    WANT_ISO=$(date -u -d "@$RESET_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u -r "$RESET_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+    assert_eq "stdin rates: resets_at stored as ISO" \
+        "$(jq -r '.five_hour.resets_at' "$USAGE_CACHE")" "$WANT_ISO"
+else
+    echo "FAIL: stdin rates did not create usage cache"; FAIL=$(( FAIL + 1 ))
+fi
+
+# Restore the live cache exactly as it was
+if [ -s "$USAGE_BACKUP" ]; then
+    mv -f "$USAGE_BACKUP" "$USAGE_CACHE"
+else
+    rm -f "$USAGE_CACHE" "$USAGE_BACKUP"
+fi
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

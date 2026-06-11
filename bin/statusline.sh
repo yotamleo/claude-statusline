@@ -107,6 +107,22 @@ iso_to_epoch() {
     return 1
 }
 
+epoch_to_iso() {
+    local epoch="$1"
+    [ -z "$epoch" ] || [ "$epoch" = "null" ] || [ "$epoch" = "0" ] && return
+
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+        # Already ISO (or unknown format) — pass through untouched
+        printf "%s" "$epoch"
+        return
+    fi
+
+    local iso
+    iso=$(date -u -d "@${epoch}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+    [ -z "$iso" ] && iso=$(date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+    printf "%s" "$iso"
+}
+
 # ── Extract JSON data ───────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 model_id=$(echo "$input" | jq -r '.model.id // "claude-sonnet"')
@@ -199,11 +215,13 @@ seven_day_pct=""
 seven_day_reset_epoch=""
 
 stdin_five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
+stdin_seven_pct=""
 if [ -n "$stdin_five_pct" ]; then
     has_stdin_rates=true
     five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
     five_hour_reset_epoch=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-    seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
+    stdin_seven_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
+    seven_day_pct=$(printf "%s" "$stdin_seven_pct" | awk '{printf "%.0f", $1}')
     seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 fi
 
@@ -286,6 +304,46 @@ else
         usage_data=$(cat "$cache_file" 2>/dev/null)
         if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
             extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
+        else
+            usage_data=""
+        fi
+    fi
+
+    # Keep the cache fresh from stdin rates. During live sessions stdin
+    # carries rate_limits, so the API branch above never runs — without
+    # this write the cache freezes at its last pre-session value for the
+    # whole session (external consumers read this file). Same schema as
+    # the API response (utilization + ISO resets_at), same 60s throttle,
+    # atomic tmp+mv so concurrent sessions never leave a torn file.
+    needs_refresh=true
+    if [ -f "$cache_file" ]; then
+        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        cache_age=$(( now - cache_mtime ))
+        [ "$cache_age" -lt "$cache_max_age" ] && needs_refresh=false
+    fi
+
+    if $needs_refresh; then
+        five_hour_reset_iso=$(epoch_to_iso "$five_hour_reset_epoch")
+        seven_day_reset_iso=$(epoch_to_iso "$seven_day_reset_epoch")
+        stdin_cache=$(jq -n \
+            --argjson prev "${usage_data:-null}" \
+            --arg fh_util "$stdin_five_pct" \
+            --arg fh_reset "$five_hour_reset_iso" \
+            --arg sd_util "$stdin_seven_pct" \
+            --arg sd_reset "$seven_day_reset_iso" \
+            '($prev // {}) +
+             { five_hour: { utilization: ($fh_util | tonumber),
+                            resets_at: (if $fh_reset == "" then null else $fh_reset end) } } +
+             (if $sd_util == "" then {} else
+               { seven_day: { utilization: ($sd_util | tonumber),
+                              resets_at: (if $sd_reset == "" then null else $sd_reset end) } } end)' \
+            2>/dev/null)
+        if [ -n "$stdin_cache" ]; then
+            tmp_cache="${cache_file}.$$.tmp"
+            if echo "$stdin_cache" > "$tmp_cache" 2>/dev/null; then
+                mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache"
+            fi
         fi
     fi
 fi

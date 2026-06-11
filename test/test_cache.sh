@@ -213,5 +213,122 @@ echo "$plain" | grep -q "cost" && { echo "PASS: cost present"; PASS=$(( PASS + 1
 
 rm -rf "$TMPDIR_BL"
 
+# ── stdin rate_limits → usage cache write (regression) ────
+# Bug: the only usage-cache write lived in the API-fallback branch, so the
+# cache froze for the whole session once stdin carried rate_limits.
+USAGE_CACHE=/tmp/claude/statusline-usage-cache.json
+USAGE_BACKUP=$(mktemp)
+SL_ERR=$(mktemp)
+USAGE_HAD_FILE=false
+if [ -f "$USAGE_CACHE" ]; then
+    USAGE_HAD_FILE=true
+    cp "$USAGE_CACHE" "$USAGE_BACKUP"
+fi
+# Restore the live cache exactly as it was — trap so a mid-test failure
+# under set -e can't destroy it. Presence flag (not -s) so an originally
+# empty cache file is restored as an empty file, not deleted.
+restore_usage_cache() {
+    if $USAGE_HAD_FILE; then
+        mv -f "$USAGE_BACKUP" "$USAGE_CACHE"
+    else
+        rm -f "$USAGE_CACHE" "$USAGE_BACKUP"
+    fi
+    rm -f "$SL_ERR"
+}
+trap restore_usage_cache EXIT
+
+run_statusline() {  # $1 = stdin payload; stderr kept for FAIL output
+    printf '%s' "$1" | bash "$STATUSLINE" >/dev/null 2>"$SL_ERR" || true
+}
+fail_with_stderr() {
+    echo "FAIL: $1"
+    [ -s "$SL_ERR" ] && sed 's/^/  stderr: /' "$SL_ERR"
+    FAIL=$(( FAIL + 1 ))
+}
+age_cache() {  # push the cache mtime past the 60s write throttle
+    local past=$(( $(date +%s) - 3600 ))
+    touch -d "@${past}" "$USAGE_CACHE" 2>/dev/null \
+        || touch -t "$(date -r "$past" +%Y%m%d%H%M.%S)" "$USAGE_CACHE"
+}
+
+# 1) Cold cache + full payload → write lands, numeric types, ISO resets_at
+rm -f "$USAGE_CACHE"
+RESET_EPOCH=$(( NOW + 7200 ))
+WANT_ISO=$(date -u -d "@$RESET_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r "$RESET_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+PAYLOAD_FULL=$(printf '{"model":{"display_name":"T","id":"claude-sonnet-4-6"},"cwd":"/tmp","rate_limits":{"five_hour":{"used_percentage":42.7,"resets_at":%s},"seven_day":{"used_percentage":63.2,"resets_at":%s}}}' \
+    "$RESET_EPOCH" "$RESET_EPOCH")
+run_statusline "$PAYLOAD_FULL"
+
+if [ -f "$USAGE_CACHE" ]; then
+    assert_eq "stdin rates: five_hour.utilization cached" \
+        "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "42.7"
+    assert_eq "stdin rates: utilization is a JSON number" \
+        "$(jq -r '.five_hour.utilization | type' "$USAGE_CACHE")" "number"
+    assert_eq "stdin rates: seven_day.utilization cached" \
+        "$(jq -r '.seven_day.utilization' "$USAGE_CACHE")" "63.2"
+    assert_eq "stdin rates: five_hour.resets_at stored as ISO" \
+        "$(jq -r '.five_hour.resets_at' "$USAGE_CACHE")" "$WANT_ISO"
+    assert_eq "stdin rates: seven_day.resets_at stored as ISO" \
+        "$(jq -r '.seven_day.resets_at' "$USAGE_CACHE")" "$WANT_ISO"
+else
+    fail_with_stderr "stdin rates did not create usage cache"
+fi
+
+# 2) 60s throttle: an immediate second render must NOT rewrite the cache
+if [ -f "$USAGE_CACHE" ]; then
+    MTIME_BEFORE=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null || stat -f %m "$USAGE_CACHE")
+    run_statusline "${PAYLOAD_FULL/42.7/55.5}"
+    MTIME_AFTER=$(stat -c %Y "$USAGE_CACHE" 2>/dev/null || stat -f %m "$USAGE_CACHE")
+    assert_eq "throttle: mtime unchanged within 60s" "$MTIME_AFTER" "$MTIME_BEFORE"
+    assert_eq "throttle: utilization unchanged within 60s" \
+        "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "42.7"
+fi
+
+# 3) Merge semantics: extra_usage + prior seven_day survive a
+#    five_hour-only stdin write (external consumers read extra_usage)
+printf '{"five_hour":{"utilization":1,"resets_at":null},"seven_day":{"utilization":63.2,"resets_at":"%s"},"extra_usage":{"is_enabled":true}}' \
+    "$WANT_ISO" > "$USAGE_CACHE"
+age_cache
+PAYLOAD_FH_ONLY='{"model":{"display_name":"T","id":"claude-sonnet-4-6"},"cwd":"/tmp","rate_limits":{"five_hour":{"used_percentage":48.1,"resets_at":'"$RESET_EPOCH"'}}}'
+run_statusline "$PAYLOAD_FH_ONLY"
+assert_eq "merge: five_hour updated from stdin" \
+    "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "48.1"
+assert_eq "merge: extra_usage preserved across stdin write" \
+    "$(jq -r '.extra_usage.is_enabled' "$USAGE_CACHE")" "true"
+assert_eq "merge: prior seven_day retained when stdin lacks it" \
+    "$(jq -r '.seven_day.utilization' "$USAGE_CACHE")" "63.2"
+
+# 4a) Corrupt prev (invalid JSON) heals on next aged render
+printf 'not json{{{' > "$USAGE_CACHE"
+age_cache
+run_statusline "$PAYLOAD_FULL"
+if jq -e 'type == "object"' "$USAGE_CACHE" >/dev/null 2>&1; then
+    assert_eq "heal invalid-JSON prev: five_hour written" \
+        "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "42.7"
+else
+    fail_with_stderr "invalid-JSON cache not healed to an object"
+fi
+
+# 4b) Corrupt prev (valid JSON but non-object) heals too
+printf '"just a string"' > "$USAGE_CACHE"
+age_cache
+run_statusline "$PAYLOAD_FULL"
+if jq -e 'type == "object"' "$USAGE_CACHE" >/dev/null 2>&1; then
+    assert_eq "heal non-object prev: five_hour written" \
+        "$(jq -r '.five_hour.utilization' "$USAGE_CACHE")" "42.7"
+else
+    fail_with_stderr "non-object cache not healed to an object"
+fi
+
+# 5) One malformed stdin field degrades to null, doesn't kill the write
+rm -f "$USAGE_CACHE"
+PAYLOAD_BAD_SD='{"model":{"display_name":"T","id":"claude-sonnet-4-6"},"cwd":"/tmp","rate_limits":{"five_hour":{"used_percentage":42.7,"resets_at":'"$RESET_EPOCH"'},"seven_day":{"used_percentage":"63%","resets_at":'"$RESET_EPOCH"'}}}'
+run_statusline "$PAYLOAD_BAD_SD"
+assert_eq "per-field guard: valid five_hour cached despite bad seven_day" \
+    "$(jq -r '.five_hour.utilization' "$USAGE_CACHE" 2>/dev/null)" "42.7"
+assert_eq "per-field guard: bad seven_day stored as null, not aborted" \
+    "$(jq -r '.seven_day.utilization' "$USAGE_CACHE" 2>/dev/null)" "null"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

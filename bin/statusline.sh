@@ -107,6 +107,36 @@ iso_to_epoch() {
     return 1
 }
 
+epoch_to_iso() {
+    local epoch="$1"
+    [ -z "$epoch" ] || [ "$epoch" = "null" ] || [ "$epoch" = "0" ] && return
+
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+        # Pass through only if it already looks ISO-shaped; anything else
+        # (fractional epochs, garbage) would leak a non-ISO resets_at into
+        # the cache schema — emit nothing so the caller stores null.
+        [[ "$epoch" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] && printf "%s" "$epoch"
+        return
+    fi
+
+    local iso
+    iso=$(date -u -d "@${epoch}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+    [ -z "$iso" ] && iso=$(date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+    printf "%s" "$iso"
+}
+
+# Append a one-line failure breadcrumb to the debug log. Capped at ~100KB
+# (truncate-on-overflow) because the failure modes it logs repeat every
+# render — a stuck mv on the shared cache must not fill /tmp over a long
+# session. Known blind spot: if /tmp/claude itself is unwritable, the
+# cache write AND this breadcrumb vanish together — there is nowhere
+# else for a statusline to report, so the log is not a complete record.
+cache_breadcrumb() {
+    local log="/tmp/claude/statusline-debug.log"
+    [ -f "$log" ] && [ "$(wc -c < "$log" 2>/dev/null || echo 0)" -gt 100000 ] && : > "$log"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) cache-write failed: $1" >> "$log" 2>/dev/null
+}
+
 # ── Extract JSON data ───────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 model_id=$(echo "$input" | jq -r '.model.id // "claude-sonnet"')
@@ -199,11 +229,13 @@ seven_day_pct=""
 seven_day_reset_epoch=""
 
 stdin_five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
+stdin_seven_pct=""
 if [ -n "$stdin_five_pct" ]; then
     has_stdin_rates=true
     five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
     five_hour_reset_epoch=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-    seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
+    stdin_seven_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
+    seven_day_pct=$(printf "%s" "$stdin_seven_pct" | awk '{printf "%.0f", $1}')
     seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 fi
 
@@ -263,7 +295,18 @@ if ! $has_stdin_rates; then
                 "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
             if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
                 usage_data="$response"
-                echo "$response" > "$cache_file"
+                # Atomic tmp+mv — a reader hitting a torn write would treat
+                # the cache as corrupt and silently drop extra_usage.
+                tmp_cache="${cache_file}.$$.tmp"
+                api_write_fail=""
+                if echo "$response" > "$tmp_cache" 2>/dev/null; then
+                    mv -f "$tmp_cache" "$cache_file" 2>/dev/null \
+                        || { rm -f "$tmp_cache" 2>/dev/null; api_write_fail="api-mv"; }
+                else
+                    rm -f "$tmp_cache" 2>/dev/null
+                    api_write_fail="api-tmp-write"
+                fi
+                [ -n "$api_write_fail" ] && cache_breadcrumb "$api_write_fail"
             fi
         fi
         if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
@@ -284,9 +327,64 @@ if ! $has_stdin_rates; then
 else
     if [ -f "$cache_file" ]; then
         usage_data=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
+        # Require an object, not just valid JSON — a bare string/number/array
+        # would make the ($prev // {}) + {} merge below a type error on every
+        # render, freezing the cache permanently.
+        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e 'type == "object"' >/dev/null 2>&1; then
             extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
+        else
+            usage_data=""
         fi
+    fi
+
+    # Keep the cache fresh from stdin rates. During live sessions stdin
+    # carries rate_limits, so the API branch above never runs — without
+    # this write the cache freezes at its last pre-session value for the
+    # whole session (external consumers read this file). Same schema as
+    # the API response (utilization + ISO resets_at), same 60s throttle,
+    # atomic tmp+mv so concurrent sessions never leave a torn file.
+    needs_refresh=true
+    if [ -f "$cache_file" ]; then
+        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        cache_age=$(( now - cache_mtime ))
+        [ "$cache_age" -lt "$cache_max_age" ] && needs_refresh=false
+    fi
+
+    if $needs_refresh; then
+        five_hour_reset_iso=$(epoch_to_iso "$five_hour_reset_epoch")
+        seven_day_reset_iso=$(epoch_to_iso "$seven_day_reset_epoch")
+        # Per-field tonumber? guards: one malformed field (e.g. "63%") must
+        # degrade to null, not abort the whole jq program and lose the write.
+        stdin_cache=$(jq -n \
+            --argjson prev "${usage_data:-null}" \
+            --arg fh_util "$stdin_five_pct" \
+            --arg fh_reset "$five_hour_reset_iso" \
+            --arg sd_util "$stdin_seven_pct" \
+            --arg sd_reset "$seven_day_reset_iso" \
+            '($prev // {}) +
+             { five_hour: { utilization: ($fh_util | tonumber? // null),
+                            resets_at: (if $fh_reset == "" then null else $fh_reset end) } } +
+             (if $sd_util == "" then {} else
+               { seven_day: { utilization: ($sd_util | tonumber? // null),
+                              resets_at: (if $sd_reset == "" then null else $sd_reset end) } } end)' \
+            2>/dev/null)
+        write_fail=""
+        if [ -n "$stdin_cache" ]; then
+            tmp_cache="${cache_file}.$$.tmp"
+            if echo "$stdin_cache" > "$tmp_cache" 2>/dev/null; then
+                mv -f "$tmp_cache" "$cache_file" 2>/dev/null \
+                    || { rm -f "$tmp_cache" 2>/dev/null; write_fail="mv"; }
+            else
+                rm -f "$tmp_cache" 2>/dev/null
+                write_fail="tmp-write"
+            fi
+        else
+            write_fail="jq-build"
+        fi
+        # Breadcrumb on failure — otherwise "no write" here is field-
+        # indistinguishable from the frozen-cache bug this branch fixes.
+        [ -n "$write_fail" ] && cache_breadcrumb "stdin-${write_fail}"
     fi
 fi
 

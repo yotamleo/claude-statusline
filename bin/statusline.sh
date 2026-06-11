@@ -112,8 +112,10 @@ epoch_to_iso() {
     [ -z "$epoch" ] || [ "$epoch" = "null" ] || [ "$epoch" = "0" ] && return
 
     if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
-        # Already ISO (or unknown format) — pass through untouched
-        printf "%s" "$epoch"
+        # Pass through only if it already looks ISO-shaped; anything else
+        # (fractional epochs, garbage) would leak a non-ISO resets_at into
+        # the cache schema — emit nothing so the caller stores null.
+        [[ "$epoch" =~ ^[0-9]{4}- ]] && printf "%s" "$epoch"
         return
     fi
 
@@ -281,7 +283,12 @@ if ! $has_stdin_rates; then
                 "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
             if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
                 usage_data="$response"
-                echo "$response" > "$cache_file"
+                # Atomic tmp+mv — a reader hitting a torn write would treat
+                # the cache as corrupt and silently drop extra_usage.
+                tmp_cache="${cache_file}.$$.tmp"
+                if echo "$response" > "$tmp_cache" 2>/dev/null; then
+                    mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache"
+                fi
             fi
         fi
         if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
@@ -302,7 +309,10 @@ if ! $has_stdin_rates; then
 else
     if [ -f "$cache_file" ]; then
         usage_data=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
+        # Require an object, not just valid JSON — a bare string/number/array
+        # would make the ($prev // {}) + {} merge below a type error on every
+        # render, freezing the cache permanently.
+        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e 'type == "object"' >/dev/null 2>&1; then
             extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
         else
             usage_data=""
@@ -326,6 +336,8 @@ else
     if $needs_refresh; then
         five_hour_reset_iso=$(epoch_to_iso "$five_hour_reset_epoch")
         seven_day_reset_iso=$(epoch_to_iso "$seven_day_reset_epoch")
+        # Per-field tonumber? guards: one malformed field (e.g. "63%") must
+        # degrade to null, not abort the whole jq program and lose the write.
         stdin_cache=$(jq -n \
             --argjson prev "${usage_data:-null}" \
             --arg fh_util "$stdin_five_pct" \
@@ -333,18 +345,30 @@ else
             --arg sd_util "$stdin_seven_pct" \
             --arg sd_reset "$seven_day_reset_iso" \
             '($prev // {}) +
-             { five_hour: { utilization: ($fh_util | tonumber),
+             { five_hour: { utilization: ($fh_util | tonumber? // null),
                             resets_at: (if $fh_reset == "" then null else $fh_reset end) } } +
              (if $sd_util == "" then {} else
-               { seven_day: { utilization: ($sd_util | tonumber),
+               { seven_day: { utilization: ($sd_util | tonumber? // null),
                               resets_at: (if $sd_reset == "" then null else $sd_reset end) } } end)' \
             2>/dev/null)
+        write_fail=""
         if [ -n "$stdin_cache" ]; then
             tmp_cache="${cache_file}.$$.tmp"
             if echo "$stdin_cache" > "$tmp_cache" 2>/dev/null; then
-                mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache"
+                mv -f "$tmp_cache" "$cache_file" 2>/dev/null \
+                    || { rm -f "$tmp_cache" 2>/dev/null; write_fail="mv"; }
+            else
+                rm -f "$tmp_cache" 2>/dev/null
+                write_fail="tmp-write"
             fi
+        else
+            write_fail="jq-build"
         fi
+        # Breadcrumb on failure — otherwise "no write" here is field-
+        # indistinguishable from the frozen-cache bug this branch fixes.
+        [ -n "$write_fail" ] && \
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) stdin-cache-write failed: ${write_fail}" \
+                >> /tmp/claude/statusline-debug.log 2>/dev/null
     fi
 fi
 

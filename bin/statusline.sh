@@ -483,6 +483,23 @@ compute_cache_ttl() {
     else                       cache_ttl_str=$(printf "%ds" "$s")
     fi
 }
+# Renders one cache-TTL row (label + bar + remaining) as a string ending in a
+# literal "\n", for the caller to accumulate and emit via printf %b.
+# Args: $1=label  $2=ttl_str ("expired" | "47m12s" | "")  $3=ttl_pct (0-100)
+format_ttl_line() {
+    local lbl="$1" ttl_str="$2" ttl_pct="$3"
+    if [ "$ttl_str" = "expired" ]; then
+        printf '%s' "${white}${lbl}${reset} $(build_bar 0 10) ${red}expired${reset}\n"
+    elif [ -n "$ttl_str" ]; then
+        local pct_color ttl_filled ttl_empty ttl_fs="" ttl_es="" ttl_i
+        pct_color=$(color_for_pct $(( 100 - ttl_pct )))
+        ttl_filled=$(( ttl_pct * 10 / 100 ))
+        ttl_empty=$(( 10 - ttl_filled ))
+        for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
+        for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
+        printf '%s' "${white}${lbl}${reset} ${pct_color}${ttl_fs}${dim}${ttl_es}${reset} ${pct_color}${ttl_str}${reset}\n"
+    fi
+}
 # Reads session cache stats from transcript JSONL.
 # Sets: sess_reads sess_writes sess_inputs last_5m_iso last_1h_iso
 read_session_cache_stats() {
@@ -505,12 +522,114 @@ read_session_cache_stats() {
     last_5m_iso=$(echo "$stats" | jq -r '.last_5m // ""')
     last_1h_iso=$(echo "$stats" | jq -r '.last_1h // ""')
 }
-# Scans all project JSONL files, uses 30s file cache at /tmp/claude/cache-all-stats.json.
-# Sets: all_reads all_writes all_inputs
+# Rebuilds the all-sessions cache incrementally. Sets nothing; writes totals
+# to $2 (cache_file) and a per-file sums index to $3 (index_file), atomically.
+#
+# Why this is not a one-line glob: the old version ran
+#   cat "$HOME/.claude/projects"/*/*.jsonl | timeout 10 jq -s ...
+# which has two fatal flaws once a few hundred sessions accumulate:
+#   1. The glob expands to hundreds of paths — on Windows/MSYS that overflows
+#      the ~32KB argv limit, so `cat` dies with "Argument list too long",
+#      stderr is swallowed, jq slurps empty input, and every field sums to 0
+#      (the "all = 0" bug).
+#   2. Even on Linux/macOS it re-reads the entire, ever-growing history (100s
+#      of MB) every refresh — far slower than the 10s timeout, which then
+#      kills it and again writes 0.
+# This version scans with `find` (streams, no argv limit), recomputes only the
+# files changed since the last index (`-newer`), and memoizes per-file sums so
+# steady-state refreshes touch just the active session. All bulk data flows
+# through temp files / stdin, never jq args, to stay under the argv limit.
+rebuild_all_sessions_index() {
+    local proj_root="$1" cache_file="$2" index_file="$3"
+    local old_index all_paths recompute_paths recomputed out
+    local tmp_old tmp_all tmp_rc tmp
+
+    old_index=$(cat "$index_file" 2>/dev/null)
+    echo "$old_index" | jq -e 'type == "object"' >/dev/null 2>&1 || old_index='{}'
+
+    # Current transcripts (one dir level down). `find` streams paths, so this
+    # never hits the argv limit the glob did.
+    all_paths=$(find "$proj_root" -mindepth 2 -maxdepth 2 -name '*.jsonl' 2>/dev/null)
+    [ -z "$all_paths" ] && return
+
+    # Files to recompute: those modified since the last index write (so the
+    # active session and any new files), or everything on a cold first run.
+    if [ -f "$index_file" ]; then
+        recompute_paths=$(find "$proj_root" -mindepth 2 -maxdepth 2 -name '*.jsonl' -newer "$index_file" 2>/dev/null)
+    else
+        recompute_paths="$all_paths"
+    fi
+
+    # Recompute changed files one at a time → path<TAB>reads<TAB>writes<TAB>inputs.
+    # Cheap in steady state (usually just the active transcript).
+    recomputed=""
+    if [ -n "$recompute_paths" ]; then
+        local fpath sums line
+        while IFS= read -r fpath; do
+            [ -z "$fpath" ] && continue
+            sums=$(jq -rs '[ ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
+                             ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
+                             ([.[] | select(.type == "assistant") | .message.usage.input_tokens               // 0] | add // 0)
+                           ] | @tsv' "$fpath" 2>/dev/null)
+            [ -z "$sums" ] && sums=$(printf '0\t0\t0')
+            line=$(printf '%s\t%s' "$fpath" "$sums")
+            recomputed="${recomputed}${line}"$'\n'
+        done <<EOF
+$recompute_paths
+EOF
+    fi
+
+    # Assemble the new index (recomputed entries override carried-forward ones,
+    # deleted files drop out because we only iterate current paths) and the
+    # totals. Everything large goes through temp files, never jq args.
+    tmp_old=$(mktemp 2>/dev/null) || return
+    tmp_all=$(mktemp 2>/dev/null) || { rm -f "$tmp_old"; return; }
+    tmp_rc=$(mktemp  2>/dev/null) || { rm -f "$tmp_old" "$tmp_all"; return; }
+    printf '%s'   "$old_index"   > "$tmp_old"
+    printf '%s\n' "$all_paths"   > "$tmp_all"
+    printf '%s'   "$recomputed"  > "$tmp_rc"
+
+    out=$(jq -n --rawfile old "$tmp_old" --rawfile allp "$tmp_all" --rawfile recomp "$tmp_rc" '
+        ($old | fromjson? // {}) as $oldidx
+        | ($recomp | split("\n") | map(select(length > 0) | split("\t"))
+            | map({ key: .[0], value: { reads:  (.[1] | tonumber? // 0),
+                                        writes: (.[2] | tonumber? // 0),
+                                        inputs: (.[3] | tonumber? // 0) } })
+            | from_entries) as $rc
+        | ($allp | split("\n") | map(select(length > 0))) as $files
+        | reduce $files[] as $p
+            ({ index: {}, reads: 0, writes: 0, inputs: 0 };
+             ($rc[$p] // $oldidx[$p] // null) as $e
+             | if $e == null then .
+               else .index[$p] = { reads: $e.reads, writes: $e.writes, inputs: $e.inputs }
+                  | .reads  += $e.reads
+                  | .writes += $e.writes
+                  | .inputs += $e.inputs
+               end)' 2>/dev/null)
+    rm -f "$tmp_old" "$tmp_all" "$tmp_rc"
+    [ -z "$out" ] && return
+
+    # Atomic tmp+mv so a concurrent reader never sees a torn file.
+    tmp="${index_file}.$$.tmp"
+    if echo "$out" | jq -c '.index' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$index_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+    tmp="${cache_file}.$$.tmp"
+    if echo "$out" | jq -c '{ reads, writes, inputs }' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$cache_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+# Returns all-sessions cache totals, refreshing via a single locked background
+# rebuild (30s throttle). Sets: all_reads all_writes all_inputs
 read_all_sessions_cache_stats() {
     all_reads=0; all_writes=0; all_inputs=0
 
     local cache_file="/tmp/claude/cache-all-stats.json"
+    local index_file="/tmp/claude/cache-all-stats-index.json"
     local cache_max_age=30
     local needs_refresh=true
 
@@ -524,19 +643,24 @@ read_all_sessions_cache_stats() {
     fi
 
     if $needs_refresh; then
-        local _cf="$cache_file" _home="$HOME"
-        ( set +f
-          _s=$(cat "$_home/.claude/projects"/*/*.jsonl 2>/dev/null \
-              | timeout 10 jq -s '{
-                  reads:  ([.[] | select(.type == "assistant") | .message.usage.cache_read_input_tokens   // 0] | add // 0),
-                  writes: ([.[] | select(.type == "assistant") | .message.usage.cache_creation_input_tokens // 0] | add // 0),
-                  inputs: ([.[] | select(.type == "assistant") | .message.usage.input_tokens              // 0] | add // 0)
-                }' 2>/dev/null)
-          [ -n "$_s" ] && echo "$_s" > "$_cf"
-        ) & disown 2>/dev/null || true
+        local proj_root="$HOME/.claude/projects" lock="${index_file}.lock"
+        # Clear a stale lock left by a crashed rebuild so refresh can't wedge.
+        if [ -d "$lock" ]; then
+            local lock_mtime
+            lock_mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo 0)
+            [ "$(( $(date +%s) - lock_mtime ))" -gt 300 ] && rmdir "$lock" 2>/dev/null
+        fi
+        # mkdir is atomic → exactly one rebuild at a time; prevents pile-up
+        # while a slow cold-start scan of a large history is in flight.
+        if mkdir "$lock" 2>/dev/null; then
+            local _pr="$proj_root" _cf="$cache_file" _if="$index_file" _lk="$lock"
+            ( trap 'rmdir "$_lk" 2>/dev/null' EXIT
+              rebuild_all_sessions_index "$_pr" "$_cf" "$_if"
+            ) & disown 2>/dev/null || true
+        fi
     fi
 
-    # Return last cached value immediately (may be one render stale during refresh)
+    # Return last cached totals immediately (may be one render stale during refresh).
     [ ! -f "$cache_file" ] && return
     local data
     data=$(cat "$cache_file" 2>/dev/null) || return
@@ -559,45 +683,38 @@ build_cache_lines() {
     get_model_savings_rate "$model_id"
 
     # ── TTL lines ──────────────────────────────────────────
+    # Compute both tiers up front, then hide an *expired* tier when the other
+    # is still live — otherwise a single early 5m-cache write leaves a permanent
+    # "5m-cache expired" row cluttering an otherwise-1h-cache session.
     local ttl_lines=""
-    local both_tiers=false
-    [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ] && \
-    [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ] && both_tiers=true
+    local h1_str="" h1_pct=0 m5_str="" m5_pct=0
+    local present_1h=false present_5m=false h1_live=false m5_live=false
 
     if [ -n "$last_1h_iso" ] && [ "$last_1h_iso" != "" ]; then
         compute_cache_ttl "$last_1h_iso" 3600
-        local lbl="cache   "
-        $both_tiers && lbl="1h-cache"
-        if [ "$cache_ttl_str" = "expired" ]; then
-            ttl_lines+="${white}${lbl}${reset} $(build_bar 0 10) ${red}expired${reset}\n"
-        elif [ -n "$cache_ttl_str" ]; then
-            local pct_color
-            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
-            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
-            local ttl_empty=$(( 10 - ttl_filled ))
-            local ttl_fs="" ttl_es="" ttl_i
-            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
-            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
-            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
-            ttl_lines+="${white}${lbl}${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
-        fi
+        h1_str="$cache_ttl_str"; h1_pct="$cache_ttl_pct"; present_1h=true
+        [ "$h1_str" != "expired" ] && [ -n "$h1_str" ] && h1_live=true
     fi
-
     if [ -n "$last_5m_iso" ] && [ "$last_5m_iso" != "" ]; then
         compute_cache_ttl "$last_5m_iso" 300
-        if [ "$cache_ttl_str" = "expired" ]; then
-            ttl_lines+="${white}5m-cache${reset} $(build_bar 0 10) ${red}expired${reset}\n"
-        elif [ -n "$cache_ttl_str" ]; then
-            local pct_color
-            pct_color=$(color_for_pct $(( 100 - cache_ttl_pct )))
-            local ttl_filled=$(( cache_ttl_pct * 10 / 100 ))
-            local ttl_empty=$(( 10 - ttl_filled ))
-            local ttl_fs="" ttl_es="" ttl_i
-            for (( ttl_i=0; ttl_i<ttl_filled; ttl_i++ )); do ttl_fs+="●"; done
-            for (( ttl_i=0; ttl_i<ttl_empty;  ttl_i++ )); do ttl_es+="○"; done
-            local ttl_bar="${pct_color}${ttl_fs}${dim}${ttl_es}${reset}"
-            ttl_lines+="${white}5m-cache${reset} ${ttl_bar} ${pct_color}${cache_ttl_str}${reset}\n"
-        fi
+        m5_str="$cache_ttl_str"; m5_pct="$cache_ttl_pct"; present_5m=true
+        [ "$m5_str" != "expired" ] && [ -n "$m5_str" ] && m5_live=true
+    fi
+
+    local show_1h=false show_5m=false
+    if $present_1h && ! { [ "$h1_str" = "expired" ] && $m5_live; }; then show_1h=true; fi
+    if $present_5m && ! { [ "$m5_str" = "expired" ] && $h1_live; }; then show_5m=true; fi
+
+    local both_shown=false
+    $show_1h && $show_5m && both_shown=true
+
+    if $show_1h; then
+        local lbl="cache   "
+        $both_shown && lbl="1h-cache"
+        ttl_lines+="$(format_ttl_line "$lbl" "$h1_str" "$h1_pct")"
+    fi
+    if $show_5m; then
+        ttl_lines+="$(format_ttl_line "5m-cache" "$m5_str" "$m5_pct")"
     fi
 
     # ── Session stats line ─────────────────────────────────

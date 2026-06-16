@@ -213,6 +213,90 @@ echo "$plain" | grep -q "cost" && { echo "PASS: cost present"; PASS=$(( PASS + 1
 
 rm -rf "$TMPDIR_BL"
 
+# ── rebuild_all_sessions_index: argv-safe + incremental ───
+# Regression: the old glob `cat .../projects/*/*.jsonl` overflowed the argv
+# limit at scale → empty input → 0/0/0. This scans with find and memoizes
+# per-file sums, recomputing only files newer than the index.
+TMPDIR_RB=$(mktemp -d)
+RB_PROJ="$TMPDIR_RB/.claude/projects"
+mkdir -p "$RB_PROJ/proj-a" "$RB_PROJ/proj-b"
+cat > "$RB_PROJ/proj-a/s1.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":1000,"cache_read_input_tokens":2000}}}
+EOF
+cat > "$RB_PROJ/proj-b/s2.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":3000,"cache_read_input_tokens":4000}}}
+EOF
+RB_CACHE="$TMPDIR_RB/cache.json"
+RB_INDEX="$TMPDIR_RB/index.json"
+
+rebuild_all_sessions_index "$RB_PROJ" "$RB_CACHE" "$RB_INDEX" || true
+assert_eq "rebuild totals reads"   "$(jq -r '.reads'  "$RB_CACHE" 2>/dev/null)" "6000"
+assert_eq "rebuild totals writes"  "$(jq -r '.writes' "$RB_CACHE" 2>/dev/null)" "4000"
+assert_eq "rebuild totals inputs"  "$(jq -r '.inputs' "$RB_CACHE" 2>/dev/null)" "150"
+assert_eq "rebuild index has 2 files" "$(jq -r 'length' "$RB_INDEX" 2>/dev/null)" "2"
+
+# Incremental: a new session newer than the index is folded in; unchanged
+# files are carried from the index, not re-read.
+sleep 1
+cat > "$RB_PROJ/proj-a/s3.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":500,"cache_read_input_tokens":700}}}
+EOF
+rebuild_all_sessions_index "$RB_PROJ" "$RB_CACHE" "$RB_INDEX" || true
+assert_eq "incremental reads include new file"  "$(jq -r '.reads'  "$RB_CACHE" 2>/dev/null)" "6700"
+assert_eq "incremental writes include new file" "$(jq -r '.writes' "$RB_CACHE" 2>/dev/null)" "4500"
+assert_eq "incremental index has 3 files" "$(jq -r 'length' "$RB_INDEX" 2>/dev/null)" "3"
+
+# Deleted files drop out (rebuild iterates only currently-present paths).
+rm -f "$RB_PROJ/proj-b/s2.jsonl"
+rebuild_all_sessions_index "$RB_PROJ" "$RB_CACHE" "$RB_INDEX" || true
+assert_eq "deleted file removed from reads" "$(jq -r '.reads' "$RB_CACHE" 2>/dev/null)" "2700"
+assert_eq "deleted index has 2 files" "$(jq -r 'length' "$RB_INDEX" 2>/dev/null)" "2"
+
+rm -rf "$TMPDIR_RB"
+
+# ── build_cache_lines: hide expired tier when the other is live ──
+TMPDIR_T1=$(mktemp -d)
+mkdir -p "$TMPDIR_T1/.claude/projects/x"
+NOW2=$(date +%s)
+ISO_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ISO_6M_AGO=$(date -d "@$(( NOW2 - 360 ))" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r $(( NOW2 - 360 )) +"%Y-%m-%dT%H:%M:%SZ")
+ISO_1M_AGO=$(date -d "@$(( NOW2 - 60 ))" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -r $(( NOW2 - 60 )) +"%Y-%m-%dT%H:%M:%SZ")
+
+# 5m write 6min ago (expired) + 1h write now (live) → only the 1h tier shows
+T1_TX="$TMPDIR_T1/sess.jsonl"
+cat > "$T1_TX" <<EOF
+{"type":"assistant","timestamp":"${ISO_6M_AGO}","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}
+{"type":"assistant","timestamp":"${ISO_NOW}","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":20,"cache_creation_input_tokens":5000,"cache_read_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5000}}}}
+EOF
+rm -f /tmp/claude/cache-all-stats.json /tmp/claude/cache-all-stats-index.json
+HOME="$TMPDIR_T1" build_cache_lines "$T1_TX" "claude-sonnet-4-6" ""
+plain1=$(printf "%b" "$cache_lines" | sed 's/\x1b\[[0-9;]*m//g')
+if echo "$plain1" | grep -q "5m-cache"; then
+    echo "FAIL: expired 5m tier shown while 1h live"; echo "  got: $plain1"; FAIL=$(( FAIL + 1 ))
+else
+    echo "PASS: expired 5m tier hidden while 1h live"; PASS=$(( PASS + 1 ))
+fi
+echo "$plain1" | grep -q "cache" && { echo "PASS: live 1h tier shown"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: live 1h tier missing in: $plain1"; FAIL=$(( FAIL + 1 )); }
+
+# Both tiers live → both shown, with explicit 1h/5m labels
+T1_TX2="$TMPDIR_T1/sess2.jsonl"
+cat > "$T1_TX2" <<EOF
+{"type":"assistant","timestamp":"${ISO_1M_AGO}","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}
+{"type":"assistant","timestamp":"${ISO_NOW}","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":20,"cache_creation_input_tokens":5000,"cache_read_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5000}}}}
+EOF
+rm -f /tmp/claude/cache-all-stats.json /tmp/claude/cache-all-stats-index.json
+HOME="$TMPDIR_T1" build_cache_lines "$T1_TX2" "claude-sonnet-4-6" ""
+plain2=$(printf "%b" "$cache_lines" | sed 's/\x1b\[[0-9;]*m//g')
+echo "$plain2" | grep -q "1h-cache" && { echo "PASS: both-live shows 1h-cache label"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: 1h-cache label missing when both live: $plain2"; FAIL=$(( FAIL + 1 )); }
+echo "$plain2" | grep -q "5m-cache" && { echo "PASS: both-live shows 5m-cache label"; PASS=$(( PASS + 1 )); } || \
+    { echo "FAIL: 5m-cache label missing when both live: $plain2"; FAIL=$(( FAIL + 1 )); }
+
+rm -rf "$TMPDIR_T1"
+
 # ── stdin rate_limits → usage cache write (regression) ────
 # Bug: the only usage-cache write lived in the API-fallback branch, so the
 # cache froze for the whole session once stdin carried rate_limits.

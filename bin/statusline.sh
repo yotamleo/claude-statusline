@@ -472,10 +472,24 @@ fi
 format_tokens() {
     local n="${1:-0}"
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
-    if   [ "$n" -ge 1000000 ]; then awk -v n="$n" 'BEGIN{printf "%.1fM", n/1000000}'
-    elif [ "$n" -ge 1000 ];    then awk -v n="$n" 'BEGIN{printf "%.0fk", n/1000}'
+    if   [ "$n" -ge 1000000000 ]; then awk -v n="$n" 'BEGIN{printf "%.1fB", n/1000000000}'
+    elif [ "$n" -ge 1000000 ];    then awk -v n="$n" 'BEGIN{printf "%.1fM", n/1000000}'
+    elif [ "$n" -ge 1000 ];       then awk -v n="$n" 'BEGIN{printf "%.0fk", n/1000}'
     else printf "%s" "$n"
     fi
+}
+# Humanize a positive USD amount for readability: K/M/B once it reaches $1000,
+# else the caller's raw %.4f (so sub-$1000 displays — and the byte-exact golden
+# fixture — are unchanged). Returns the number WITHOUT a leading $ (the caller
+# adds it). Callers pass an already-absolute value; sign is handled separately.
+format_usd() {
+    local n="${1:-0}"
+    awk -v n="$n" 'BEGIN{
+        if      (n >= 1000000000) printf "%.1fB", n/1000000000;
+        else if (n >= 1000000)    printf "%.1fM", n/1000000;
+        else if (n >= 1000)       printf "%.1fK", n/1000;
+        else                      printf "%.4f", n;
+    }'
 }
 # Sets read_savings_rate and write_overhead_rate (USD per token, float)
 get_model_savings_rate() {
@@ -895,7 +909,7 @@ build_cache_lines() {
     net_usd=$(awk -v r="$sess_reads" -v w="$sess_writes" \
               -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
               'BEGIN{printf "%.4f", r*rs - w*wo}')
-    net_abs=$(awk -v n="$net_usd" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    net_abs=$(format_usd "$(awk -v n="$net_usd" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')")
     if awk -v n="$net_usd" 'BEGIN{exit !(n >= 0)}'; then
         net_sign="+"; net_color="$green"
     else
@@ -905,7 +919,7 @@ build_cache_lines() {
     local cost_part=""
     if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && \
        awk -v c="$session_cost" 'BEGIN{exit !(c+0 > 0)}'; then
-        cost_part="  ${dim}cost${reset} ${white}$(printf '$%.4f' "$session_cost")${reset}"
+        cost_part="  ${dim}cost${reset} ${white}\$$(format_usd "$session_cost")${reset}"
     fi
 
     local sess_line="${white}session${reset}  "
@@ -929,7 +943,7 @@ build_cache_lines() {
     all_net=$(awk -v r="$all_reads" -v w="$all_writes" \
               -v rs="$read_savings_rate" -v wo="$write_overhead_rate" \
               'BEGIN{printf "%.4f", r*rs - w*wo}')
-    all_abs=$(awk -v n="$all_net" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')
+    all_abs=$(format_usd "$(awk -v n="$all_net" 'BEGIN{if(n<0)n=-n; printf "%.4f",n}')")
     if awk -v n="$all_net" 'BEGIN{exit !(n >= 0)}'; then
         all_sign="+"; all_color="$green"
     else

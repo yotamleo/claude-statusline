@@ -690,8 +690,44 @@ rebuild_all_sessions_index() {
 
     # Files to recompute: those modified since the last index write (so the
     # active session and any new files), or everything on a cold first run.
+    #
+    # PLUS a bounded backfill of transcripts ABSENT from the carried-forward
+    # index (HIMMEL-698). A file that predates the index's first write and was
+    # never itself the freshly-written active transcript is never `-newer`, so
+    # without this it is never recomputed and — because it never entered
+    # $oldidx either — is permanently dropped from the aggregate: the reduce
+    # below skips any path that is neither in $rc nor $oldidx. On a large
+    # history whose cold full-scan never completed, the "all" row then reflects
+    # only the handful of files that happened to be the active transcript at a
+    # render (observed: 6 of 1812 files → a stuck, implausibly-low total).
+    # The backfill is BOUNDED per rebuild (default 400, override
+    # HIMMEL_STATUSLINE_BACKFILL_MAX) so a single refresh can't exceed the
+    # stale-lock reaper window on a huge back-catalogue; the index grows
+    # monotonically (a backfilled file's mtime predates the new index write, so
+    # it is carried forward, not re-scanned), so the aggregate heals over
+    # successive renders. Cold start (no index) is unchanged — it already scans
+    # every file — so this only affects the incremental path.
     if [ -f "$index_file" ]; then
         recompute_paths=$(find "$proj_root" -mindepth 2 -maxdepth 2 -name '*.jsonl' -newer "$index_file" 2>/dev/null)
+        local backfill_max="${HIMMEL_STATUSLINE_BACKFILL_MAX:-400}"
+        case "$backfill_max" in ''|*[!0-9]*) backfill_max=400 ;; esac
+        if [ "$backfill_max" -gt 0 ]; then
+            local tmp_known missing
+            tmp_known=$(mktemp 2>/dev/null) || tmp_known=""
+            if [ -n "$tmp_known" ]; then
+                # Known = paths already in the index. Any all_paths entry not in
+                # it is a never-scanned historical file → backfill up to N.
+                printf '%s\n' "$old_index" | jq -r 'keys[]?' 2>/dev/null \
+                    | LC_ALL=C sort -u > "$tmp_known"
+                missing=$(printf '%s\n' "$all_paths" | grep -v '^$' | LC_ALL=C sort -u \
+                    | LC_ALL=C comm -23 - "$tmp_known" | head -n "$backfill_max")
+                rm -f "$tmp_known" 2>/dev/null
+                if [ -n "$missing" ]; then
+                    recompute_paths=$(printf '%s\n%s' "$recompute_paths" "$missing" \
+                        | grep -v '^$' | LC_ALL=C sort -u)
+                fi
+            fi
+        fi
     else
         recompute_paths="$all_paths"
     fi

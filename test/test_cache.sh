@@ -275,6 +275,68 @@ assert_eq "deleted index has 2 files" "$(jq -r 'length' "$RB_INDEX" 2>/dev/null)
 
 rm -rf "$TMPDIR_RB"
 
+# ── rebuild_all_sessions_index: backfill history predating the index (HIMMEL-698) ─
+# Regression: recompute candidates were ONLY files `-newer` than the index, so a
+# transcript that predates the index's first write and was never the active
+# (freshly-written) transcript was never recomputed and never entered the
+# carried-forward index — permanently dropped from the aggregate. Result: the
+# "all" total reflected only the few files touched since the index appeared
+# (observed 6 of 1812 → a stuck, implausibly-low number). The fix backfills
+# files absent from the index (bounded per rebuild). Here we seed an index that
+# postdates an OLD transcript (mtime set into the past) and prove the next
+# rebuild pulls that old file into the totals.
+TMPDIR_BF=$(mktemp -d)
+BF_PROJ="$TMPDIR_BF/.claude/projects"
+mkdir -p "$BF_PROJ/proj-old" "$BF_PROJ/proj-active"
+BF_CACHE="$TMPDIR_BF/cache.json"
+BF_INDEX="$TMPDIR_BF/index.json"
+
+# An OLD historical transcript (never seen by the index) with known tokens.
+cat > "$BF_PROJ/proj-old/hist.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":11,"cache_creation_input_tokens":1111,"cache_read_input_tokens":9999}}}
+EOF
+touch -d "@$(( $(date +%s) - 86400 ))" "$BF_PROJ/proj-old/hist.jsonl" 2>/dev/null \
+    || touch -t "$(date -r "$(( $(date +%s) - 86400 ))" +%Y%m%d%H%M.%S 2>/dev/null)" "$BF_PROJ/proj-old/hist.jsonl" 2>/dev/null
+
+# Seed an index that ONLY knows the active file, and whose mtime is NEWER than
+# the old transcript — so `-newer` alone would never surface hist.jsonl. This
+# is exactly the stuck state the bug leaves behind.
+cat > "$BF_PROJ/proj-active/cur.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":500,"cache_read_input_tokens":700}}}
+EOF
+echo '{"'"$BF_PROJ"'/proj-active/cur.jsonl":{"reads":700,"writes":500,"inputs":5}}' > "$BF_INDEX"
+echo '{"reads":700,"writes":500,"inputs":5}' > "$BF_CACHE"
+# Index mtime = now (well after the old file's mtime).
+touch "$BF_INDEX"
+
+rebuild_all_sessions_index "$BF_PROJ" "$BF_CACHE" "$BF_INDEX" || true
+# Old file's 9999 reads must now be folded in (700 active + 9999 historical).
+assert_eq "backfill: historical reads folded into total"  "$(jq -r '.reads'  "$BF_CACHE" 2>/dev/null)" "10699"
+assert_eq "backfill: historical writes folded into total" "$(jq -r '.writes' "$BF_CACHE" 2>/dev/null)" "1611"
+assert_eq "backfill: index now has both files"            "$(jq -r 'length'  "$BF_INDEX" 2>/dev/null)" "2"
+
+# Bound honoured: HIMMEL_STATUSLINE_BACKFILL_MAX=0 disables backfill (old file
+# stays excluded), proving the knob gates the new behaviour.
+TMPDIR_BF0=$(mktemp -d)
+BF0_PROJ="$TMPDIR_BF0/.claude/projects"
+mkdir -p "$BF0_PROJ/proj-old" "$BF0_PROJ/proj-active"
+cat > "$BF0_PROJ/proj-old/hist.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":11,"cache_creation_input_tokens":1111,"cache_read_input_tokens":9999}}}
+EOF
+touch -d "@$(( $(date +%s) - 86400 ))" "$BF0_PROJ/proj-old/hist.jsonl" 2>/dev/null \
+    || touch -t "$(date -r "$(( $(date +%s) - 86400 ))" +%Y%m%d%H%M.%S 2>/dev/null)" "$BF0_PROJ/proj-old/hist.jsonl" 2>/dev/null
+cat > "$BF0_PROJ/proj-active/cur.jsonl" <<'EOF'
+{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":500,"cache_read_input_tokens":700}}}
+EOF
+echo '{"'"$BF0_PROJ"'/proj-active/cur.jsonl":{"reads":700,"writes":500,"inputs":5}}' > "$TMPDIR_BF0/index.json"
+echo '{"reads":700,"writes":500,"inputs":5}' > "$TMPDIR_BF0/cache.json"
+touch "$TMPDIR_BF0/index.json"
+HIMMEL_STATUSLINE_BACKFILL_MAX=0 rebuild_all_sessions_index "$BF0_PROJ" "$TMPDIR_BF0/cache.json" "$TMPDIR_BF0/index.json" || true
+assert_eq "backfill disabled (MAX=0): historical file stays excluded" "$(jq -r '.reads' "$TMPDIR_BF0/cache.json" 2>/dev/null)" "700"
+rm -rf "$TMPDIR_BF0"
+
+rm -rf "$TMPDIR_BF"
+
 # ── build_cache_lines: hide expired tier when the other is live ──
 TMPDIR_T1=$(mktemp -d)
 mkdir -p "$TMPDIR_T1/.claude/projects/x"
